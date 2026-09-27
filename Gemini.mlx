@@ -1,0 +1,247 @@
+## 1. MISSION PARAMETERS & REPO RULES
+- **Lead Developer:** P Praveen Pandi
+- **Objective:** Build a domain-agnostic, responsive analytics engine
+  that adapts instantly to the 10:00 AM secret challenge.
+- **Evaluation Gate:**
+  - `npm run build` compiles with zero TypeScript errors
+  - A live, publicly reachable deployed URL (Section 8) — not just
+    local preview
+  - Total **repository** size (tracked files, not `node_modules`/`dist`)
+    stays under 10MB
+  - Single branch only — verified with `git branch -a` before final push
+  - Repository is **public**
+  - Maximum 2 submission attempts — treat the first push as final;
+    reserve attempt 2 for a genuine blocking bug, not polish
+
+## 2. TECH STACK & AI ENGINE
+- **Core:** Vite + React 18 + TypeScript (Strict Mode)
+- **UI & Charts:** Tailwind CSS, `lucide-react`, `recharts`
+- **State:** Zustand
+- **AI SDK:** `@google/genai` — pin the exact version in `package.json`
+  (no `^` or `~` ranges). Commit `package-lock.json`.
+- **AI Model:** `gemini-3.8-flash`, structured JSON output via
+  `responseSchema`
+
+## 3. SECURITY REALITY
+- Store the development Gemini key in `.env.local`.
+- `.gitignore` MUST contain `.env*`, `!.env.example`, and `*.local`.
+  NEVER commit `.env.local`.
+- **MANDATE:** Because this is a Vite client-side app,
+  `VITE_GEMINI_API_KEY` is bundled into client JS and is NOT a true
+  secret. Use a restricted/budget-capped key for the demo. No backend
+  proxy for this timeframe.
+- Before every commit, verify no real API key appears in tracked or
+  staged files.
+
+## 4. ADAPTIVE DOMAIN CONTRACT (`src/types.ts`)
+```typescript
+export type StatusLevel = 'NOMINAL' | 'WARNING' | 'CRITICAL';
+export type TrendDirection = 'worsening' | 'improving' | 'stable';
+export type MetricPolarity = 'higher-is-better' | 'higher-is-worse';
+
+export interface ChallengeConfig {
+  appName: string;
+  problemStatement: string;
+  domain: string;
+  primaryMetricLabel: string;
+  metricUnit?: string;
+  metricPolarity: MetricPolarity;
+  warningThreshold?: number;
+  criticalThreshold?: number;
+  showSDG: boolean;
+  sdgAlignment?: string;
+}
+
+export interface DomainEntity {
+  id: string;
+  label: string;
+  status: StatusLevel;
+  primaryMetric: number;
+  historicalData: { time: string; value: number }[];
+  fallbackSummary: string;
+  fallbackAction: string;
+}
+
+export interface AIInsightResponse {
+  summary: string;
+  action: string;
+  confidence: number;
+  source: 'live' | 'fallback';
+}
+
+export interface ParsedInsight {
+  summary: string;
+  action: string;
+  confidence: number;
+}
+```
+
+## 5. DETERMINISTIC MATH, POLICY & TRUE AI LAYER (`src/services/ai.ts`)
+```typescript
+import { GoogleGenAI, Type } from '@google/genai';
+import type {
+  DomainEntity,
+  AIInsightResponse,
+  TrendDirection,
+  MetricPolarity,
+  ChallengeConfig,
+  StatusLevel,
+  ParsedInsight
+} from '../types';
+
+const insightSchema = {
+  type: Type.OBJECT,
+  properties: {
+    summary: { type: Type.STRING, description: "Exactly two-sentence operational interpretation of the trend" },
+    action: { type: Type.STRING, description: "Exactly one-sentence recommended action" },
+    confidence: { type: Type.NUMBER, description: "Model self-reported confidence from 0.0 to 1.0" }
+  },
+  required: ["summary", "action", "confidence"],
+  propertyOrdering: ["summary", "action", "confidence"]
+};
+
+export function validateThresholds(config: ChallengeConfig): void {
+  const { warningThreshold, criticalThreshold, metricPolarity } = config;
+  if (warningThreshold === undefined || criticalThreshold === undefined) return;
+
+  if (!Number.isFinite(warningThreshold) || !Number.isFinite(criticalThreshold)) {
+    throw new Error("Threshold Safety Violation: Thresholds must be finite numbers.");
+  }
+  if (metricPolarity === 'higher-is-worse' && warningThreshold >= criticalThreshold) {
+    throw new Error(`Threshold Safety Violation: warningThreshold (${warningThreshold}) must be < criticalThreshold (${criticalThreshold}).`);
+  }
+  if (metricPolarity === 'higher-is-better' && criticalThreshold >= warningThreshold) {
+    throw new Error(`Threshold Safety Violation: criticalThreshold (${criticalThreshold}) must be < warningThreshold (${warningThreshold}).`);
+  }
+}
+
+function isParsedInsight(value: unknown): value is ParsedInsight {
+  if (typeof value !== 'object' || value === null) return false;
+  const c = value as Record<string, unknown>;
+  return (
+    typeof c.summary === 'string' && c.summary.trim().length > 0 &&
+    typeof c.action === 'string' && c.action.trim().length > 0 &&
+    typeof c.confidence === 'number' && Number.isFinite(c.confidence) &&
+    c.confidence >= 0 && c.confidence <= 1
+  );
+}
+
+export function deriveStatus(value: number, config: ChallengeConfig): StatusLevel {
+  const { warningThreshold, criticalThreshold, metricPolarity } = config;
+  if (warningThreshold === undefined || criticalThreshold === undefined) return 'NOMINAL';
+  if (metricPolarity === 'higher-is-worse') {
+    if (value >= criticalThreshold) return 'CRITICAL';
+    if (value >= warningThreshold) return 'WARNING';
+    return 'NOMINAL';
+  } else {
+    if (value <= criticalThreshold) return 'CRITICAL';
+    if (value <= warningThreshold) return 'WARNING';
+    return 'NOMINAL';
+  }
+}
+
+export function calculateTrend(data: { value: number }[], polarity: MetricPolarity): TrendDirection {
+  if (data.length < 2) return 'stable';
+  const first = data[0].value;
+  const last = data[data.length - 1].value;
+  let isIncreasing = false, isDecreasing = false;
+
+  if (first === 0) {
+    if (last === 0) return 'stable';
+    isIncreasing = last > 0;
+    isDecreasing = last < 0;
+  } else {
+    const diff = (last - first) / Math.abs(first);
+    if (Math.abs(diff) <= 0.05) return 'stable';
+    isIncreasing = diff > 0.05;
+    isDecreasing = diff < -0.05;
+  }
+
+  if (polarity === 'higher-is-better') {
+    if (isIncreasing) return 'improving';
+    if (isDecreasing) return 'worsening';
+  } else {
+    if (isIncreasing) return 'worsening';
+    if (isDecreasing) return 'improving';
+  }
+  return 'stable';
+}
+
+export async function generateInsight(entityData: DomainEntity, config: ChallengeConfig): Promise<AIInsightResponse> {
+  const trend = calculateTrend(entityData.historicalData, config.metricPolarity);
+  const fallbackResponse: AIInsightResponse = {
+    summary: entityData.fallbackSummary,
+    action: entityData.fallbackAction,
+    confidence: 0,
+    source: 'fallback'
+  };
+
+  const abortController = new AbortController();
+  const timeoutId = setTimeout(() => abortController.abort(), 8000);
+
+  try {
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
+    if (!apiKey) throw new Error("Missing API Key");
+
+    const { fallbackSummary, fallbackAction, ...cleanEntityData } = entityData;
+    const ai = new GoogleGenAI({ apiKey });
+
+    const promptText = `
+Use ONLY the supplied challenge data.
+Do not invent measurements, causes, external statistics, or events.
+The deterministic trend calculation is authoritative. Do not change or reinterpret it.
+
+Domain: ${config.domain}
+Metric: ${config.primaryMetricLabel}
+Unit: ${config.metricUnit ?? 'unitless'}
+Metric Polarity: ${config.metricPolarity} (Higher values are ${config.metricPolarity === 'higher-is-better' ? 'desirable/improving' : 'adverse/worsening'})
+Deterministic Trend: ${trend}
+
+Provide:
+- exactly two sentences for summary
+- exactly one sentence for action
+- model-reported confidence from 0.0 to 1.0
+
+Data:
+${JSON.stringify(cleanEntityData)}
+`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-3.8-flash",
+      contents: promptText,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: insightSchema,
+        abortSignal: abortController.signal
+      }
+    });
+
+    const responseText = response.text;
+    if (!responseText) throw new Error("Empty AI response text");
+
+    const parsed: unknown = JSON.parse(responseText);
+    if (!isParsedInsight(parsed)) throw new Error("Invalid AI response schema structure");
+
+    return { ...parsed, source: 'live' };
+  } catch (error) {
+    console.warn("AI Generation failed or failed validation, using fallback.", error);
+    return fallbackResponse;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+```
+
+## 6. UX/UI TOPOLOGY & JUDGE MODE
+- **State (Zustand):** `challengeEntities`, `demoEntities`, `mode: 'challenge' | 'demo'`.
+  - Derive `status` via `deriveStatus()` whenever `primaryMetric` or config changes — never trust a manually set status.
+  - On mode switch, preserve both datasets; if `activeEntityId` is missing from the target dataset, default to `targetDataset[0].id`.
+- **Header:** Driven by `ChallengeConfig`. Show `sdgAlignment` only if `showSDG` is true. Include a "Challenge Mode | Demo Mode" toggle.
+- **Data Grid:** Cards with left-edge status stripes (green/amber/red), CRITICAL gets a pulsing dot. Values show `metricUnit`.
+- **Chart Panel:** `<ResponsiveContainer>` Recharts area chart of `historicalData`, threshold lines for warning/critical.
+- **AI Insight Panel:**
+  - 500ms minimum loader to avoid flashing.
+  - Source badge: `"● Live AI"` (green) when `source === 'live'`, `"○ Offline Fallback"` (gray) when `'fallback'` — never hidden or styled identically.
+  - Confidence meter only in Live AI state, labeled "AI confidence · model-reported".
+  - Deterministic trend badge shown alongside the AI summary/action.
+- **Demo Mode Banner:** `"DEMO DATA · Synthetic Scenario"` shown in header when `mode === 'demo'`.
